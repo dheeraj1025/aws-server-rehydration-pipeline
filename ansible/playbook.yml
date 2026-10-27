@@ -20,9 +20,6 @@
     app_environment: "production"
 
   tasks:
-    # -------------------------------------------------------------------------
-    # 1. System Account & Runtime Prerequisites
-    # -------------------------------------------------------------------------
     - name: Create dedicated application system group
       ansible.builtin.group:
         name: "{{ app_group }}"
