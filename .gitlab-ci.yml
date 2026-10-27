@@ -1,0 +1,169 @@
+stages:
+  - validate
+  - bake
+  - plan
+  - deploy
+  - verify
+
+variables:
+  AWS_DEFAULT_REGION: "us-east-1"
+  TF_ROOT: "terraform"
+  PACKER_ROOT: "packer"
+  APP_VERSION: "${CI_COMMIT_TAG}"
+
+default:
+  tags:
+    - aws-runner
+
+# -----------------------------------------------------------------------------
+# Stage: Validate
+# -----------------------------------------------------------------------------
+validate:packer:
+  stage: validate
+  image: hashicorp/packer:latest
+  script:
+    - cd ${PACKER_ROOT}
+    - packer init template.pkr.hcl
+    - packer validate -var="aws_region=${AWS_DEFAULT_REGION}" -var="app_version=test" template.pkr.hcl
+
+validate:ansible:
+  stage: validate
+  image: cytopia/ansible-lint:latest
+  script:
+    - ansible-lint ansible/playbook.yml
+
+validate:terraform:
+  stage: validate
+  image: hashicorp/terraform:1.6
+  script:
+    - cd ${TF_ROOT}
+    - terraform init -backend=false
+    - terraform fmt -check
+    - terraform validate
+
+# -----------------------------------------------------------------------------
+# Stage: Bake Golden AMI
+# -----------------------------------------------------------------------------
+bake:golden-ami:
+  stage: bake
+  image: 
+    name: hashicorp/packer:latest
+    entrypoint: [""]
+  before_script:
+    - apk add --no-cache bash curl jq py3-pip python3
+    - pip3 install --break-system-packages ansible-core
+  script:
+    - cd ${PACKER_ROOT}
+    - packer init template.pkr.hcl
+    - |
+      TARGET_VERSION=${APP_VERSION:-v-${CI_COMMIT_SHORT_SHA}}
+      packer build -machine-readable \
+        -var="aws_region=${AWS_DEFAULT_REGION}" \
+        -var="app_version=${TARGET_VERSION}" \
+        template.pkr.hcl | tee build.log
+    
+    # Extract the AMI ID from Packer artifact output
+    - NEW_AMI_ID=$(grep -Eo 'ami-[a-z0-9]+' build.log | tail -n 1)
+    - echo "Successfully baked AMI: ${NEW_AMI_ID}"
+    - echo "NEW_AMI_ID=${NEW_AMI_ID}" > ../packer.env
+  artifacts:
+    reports:
+      dotenv: packer.env
+    expire_in: 1 day
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG'
+
+# -----------------------------------------------------------------------------
+# Stage: Terraform Plan
+# -----------------------------------------------------------------------------
+terraform:plan:
+  stage: plan
+  image: hashicorp/terraform:1.6
+  dependencies:
+    - bake:golden-ami
+  script:
+    - cd ${TF_ROOT}
+    - terraform init
+    - terraform plan -var="ami_id=${NEW_AMI_ID}" -out=tfplan.binary
+  artifacts:
+    name: "tfplan-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - ${TF_ROOT}/tfplan.binary
+    expire_in: 2 days
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG'
+
+# -----------------------------------------------------------------------------
+# Stage: Terraform Apply (Rolling Rehydration)
+# -----------------------------------------------------------------------------
+terraform:apply:
+  stage: deploy
+  image: hashicorp/terraform:1.6
+  dependencies:
+    - bake:golden-ami
+    - terraform:plan
+  script:
+    - cd ${TF_ROOT}
+    - terraform init
+    - terraform apply -auto-approve tfplan.binary
+    - echo "ALB_DNS=$(terraform output -raw alb_dns_name)" >> ../deploy.env
+    - echo "ASG_NAME=$(terraform output -raw autoscaling_group_name)" >> ../deploy.env
+  artifacts:
+    reports:
+      dotenv: deploy.env
+  when: manual
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG'
+
+# -----------------------------------------------------------------------------
+# Stage: Post-Rehydration Smoke Verification
+# -----------------------------------------------------------------------------
+verify:canary:
+  stage: verify
+  image: amazon/aws-cli:latest
+  dependencies:
+    - terraform:apply
+  before_script:
+    - yum install -y jq curl
+  script:
+    - echo "Monitoring ASG Instance Refresh for: ${ASG_NAME}"
+    - |
+      for i in {1..30}; do
+        STATUS=$(aws autoscaling describe-instance-refreshes \
+          --auto-scaling-group-name "${ASG_NAME}" \
+          --region "${AWS_DEFAULT_REGION}" \
+          --query "InstanceRefreshes[0].Status" \
+          --output text 2>/dev/null || echo "Pending")
+        
+        echo "Refresh status ($i/30): ${STATUS}"
+        if [ "$STATUS" = "Successful" ]; then
+          break
+        elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
+          echo "FATAL: Instance refresh reached failure state: ${STATUS}"
+          exit 1
+        fi
+        sleep 15
+      done
+
+    - echo "Running canary assertion against http://${ALB_DNS}/health"
+    - |
+      TARGET_VERSION=${APP_VERSION:-v-${CI_COMMIT_SHORT_SHA}}
+      for i in {1..20}; do
+        RES=$(curl -s -m 5 "http://${ALB_DNS}/health" || echo "{}")
+        STATUS=$(echo "$RES" | jq -r '.status // empty')
+        
+        if [ "$STATUS" = "UP" ]; then
+          echo "Health check validated: ${RES}"
+          exit 0
+        fi
+        echo "Waiting for healthy endpoints ($i/20)..."
+        sleep 10
+      done
+      echo "FATAL: Validation timed out"
+      exit 1
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG'
