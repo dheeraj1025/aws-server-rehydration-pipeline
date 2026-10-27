@@ -1,0 +1,212 @@
+---
+- name: Deploy and Configure Enterprise Application Service
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # Service identity & directories
+    app_name: "production-api"
+    app_user: "apprunner"
+    app_group: "apprunner"
+    app_base_dir: "/opt/{{ app_name }}"
+    app_releases_dir: "{{ app_base_dir }}/releases"
+    app_shared_dir: "{{ app_base_dir }}/shared"
+    app_log_dir: "/var/log/{{ app_name }}"
+    
+    # Versioning & execution parameters
+    app_version: "{{ release_version | default('v2.4.1') }}"
+    app_port: 8080
+    app_environment: "production"
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # 1. System Account & Runtime Prerequisites
+    # -------------------------------------------------------------------------
+    - name: Create dedicated application system group
+      ansible.builtin.group:
+        name: "{{ app_group }}"
+        state: present
+        system: true
+
+    - name: Create dedicated application system user
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        group: "{{ app_group }}"
+        system: true
+        shell: /usr/sbin/nologin
+        create_home: false
+        state: present
+
+    - name: Install runtime package dependencies
+      ansible.builtin.package:
+        name:
+          - python3
+          - python3-pip
+          - curl
+          - tar
+          - gzip
+        state: present
+
+    # -------------------------------------------------------------------------
+    # 2. Directory Layout Setup
+    # -------------------------------------------------------------------------
+    - name: Ensure base and versioned release directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: '0755'
+      loop:
+        - "{{ app_base_dir }}"
+        - "{{ app_releases_dir }}"
+        - "{{ app_releases_dir }}/{{ app_version }}"
+        - "{{ app_shared_dir }}"
+        - "{{ app_shared_dir }}/config"
+        - "{{ app_log_dir }}"
+
+    # -------------------------------------------------------------------------
+    # 3. Artifact Delivery & Code Staging
+    # -------------------------------------------------------------------------
+    # Note: Replace this copy/template step with ansible.builtin.unarchive if pulling a .tar.gz from S3/Nexus/Artifactory
+    - name: Deploy application source binary / entrypoint
+      ansible.builtin.copy:
+        dest: "{{ app_releases_dir }}/{{ app_version }}/server.py"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: '0750'
+        content: |
+          #!/usr/bin/env python3
+          import http.server
+          import socketserver
+          import json
+          import os
+
+          PORT = int(os.environ.get("APP_PORT", 8080))
+          VERSION = os.environ.get("APP_VERSION", "unknown")
+          ENV = os.environ.get("ENVIRONMENT", "unknown")
+
+          class ApplicationHandler(http.server.SimpleHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path in ['/health', '/healthz']:
+                      self.send_response(200)
+                      self.send_header('Content-Type', 'application/json')
+                      self.end_headers()
+                      response = {
+                          "status": "UP",
+                          "version": VERSION,
+                          "environment": ENV
+                      }
+                      self.wfile.write(json.dumps(response).encode('utf-8'))
+                  else:
+                      self.send_response(404)
+                      self.end_headers()
+
+          with socketserver.TCPServer(("", PORT), ApplicationHandler) as httpd:
+              httpd.serve_forever()
+
+    # -------------------------------------------------------------------------
+    # 4. Environment & Secrets Configuration
+    # -------------------------------------------------------------------------
+    - name: Render environment configuration file
+      ansible.builtin.copy:
+        dest: "{{ app_shared_dir }}/config/app.env"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: '0600'
+        content: |
+          ENVIRONMENT={{ app_environment }}
+          APP_PORT={{ app_port }}
+          APP_VERSION={{ app_version }}
+          LOG_DIR={{ app_log_dir }}
+      notify: Restart Application
+
+    # -------------------------------------------------------------------------
+    # 5. Atomic Symlink Cutover
+    # -------------------------------------------------------------------------
+    - name: Point active deployment symlink to new release
+      ansible.builtin.file:
+        src: "{{ app_releases_dir }}/{{ app_version }}"
+        dest: "{{ app_base_dir }}/current"
+        state: link
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+      notify: Restart Application
+
+    # -------------------------------------------------------------------------
+    # 6. Systemd Service Unit Installation
+    # -------------------------------------------------------------------------
+    - name: Install systemd unit definition
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ app_name }}.service"
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description={{ app_name }} Core Service
+          After=network.target
+
+          [Service]
+          Type=simple
+          User={{ app_user }}
+          Group={{ app_group }}
+          WorkingDirectory={{ app_base_dir }}/current
+          EnvironmentFile={{ app_shared_dir }}/config/app.env
+          ExecStart=/usr/bin/python3 {{ app_base_dir }}/current/server.py
+          StandardOutput=append:{{ app_log_dir }}/service.log
+          StandardError=append:{{ app_log_dir }}/service_error.log
+          Restart=always
+          RestartSec=5
+          LimitNOFILE=65535
+
+          [Install]
+          WantedBy=multi-user.target
+      notify:
+        - Reload Systemd
+        - Restart Application
+
+    - name: Ensure application service is enabled and started
+      ansible.builtin.systemd:
+        name: "{{ app_name }}"
+        enabled: true
+        state: started
+
+    # -------------------------------------------------------------------------
+    # 7. Post-Deployment Smoke Verification
+    # -------------------------------------------------------------------------
+    - name: Flush handlers to ensure daemon is up with new code
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for application port to start listening
+      ansible.builtin.wait_for:
+        port: "{{ app_port }}"
+        delay: 2
+        timeout: 30
+        state: started
+
+    - name: Assert health endpoint returns HTTP 200 and matches target version
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ app_port }}/health"
+        method: GET
+        status_code: 200
+        return_content: true
+      register: app_health
+      failed_when: >
+        (app_health.json.status != "UP") or
+        (app_health.json.version != app_version)
+
+    - name: Output deployment verification status
+      ansible.builtin.debug:
+        msg: "Application {{ app_name }} ({{ app_version }}) successfully running on port {{ app_port }}."
+
+  handlers:
+    - name: Reload Systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Restart Application
+      ansible.builtin.systemd:
+        name: "{{ app_name }}"
+        state: restarted
