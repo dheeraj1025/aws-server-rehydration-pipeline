@@ -1,29 +1,49 @@
-# Terraform
-**/.terraform/*
+# =============================================================================
+# Terraform Artifacts & Local State
+# =============================================================================
+**/.terraform/
 *.tfstate
 *.tfstate.*
-*.tfplan*
-*.binary
+*.tfplan
+*.tfplan.binary
+.terraform.lock.hcl
 crash.log
 crash.*.log
-*.tfvars
-!*.tfvars.example
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
 
-# Packer
+# Local variable overrides (keep terraform.tfvars tracked if using baseline mock values,
+# but ignore local secret overrides)
+*.auto.tfvars
+*.auto.tfvars.json
+terraform.tfvars.local
+
+# =============================================================================
+# Packer Artifacts & Cache
+# =============================================================================
 packer_cache/
 *.pkr.hcl.lock
-packer-manifest.json
+*.log
+packer-build-*.log
 
-# Ansible
+# =============================================================================
+# Ansible Runtime & Temporary Files
+# =============================================================================
 *.retry
 .ansible/
+ansible.log
+*.pyc
+__pycache__/
 
-# Shell & Scripts
-*.log
-
-# System & Editor
+# =============================================================================
+# Pipeline & OS System Junk
+# =============================================================================
+.env
+*.env
 .DS_Store
 Thumbs.db
-.idea/
-.vscode/
 *.swp
+*.swo
+*~
